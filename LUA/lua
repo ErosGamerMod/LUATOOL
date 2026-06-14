@@ -1,0 +1,1387 @@
+#!/usr/bin/env python3
+"""
+bgmi_pipeline.py - Complete BGMI Lua Pipeline v4.2 (ENHANCED UI)
+Fixed instruction extraction and restoration with Rich UI
+Desenvolvido por: ErosGamerPUB | SKIN MOD ALL PUBG v4.2
+Créditos: @ErosGamerPUBG | Inscreva-se: @ErosGamerMOD
+"""
+
+import os
+import sys
+import io
+import pickle
+import subprocess
+import tempfile
+import struct
+import re
+import shutil
+import time
+import json # Não esqueça de garantir que isso está importado no topo do seu script!
+import traceback
+import urllib.request
+import urllib.error
+import hashlib
+import signal
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict, Any
+from dataclasses import dataclass
+from functools import lru_cache
+from datetime import datetime
+
+# Rich imports for enhanced UI
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich import print as rprint
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+    from rich.layout import Layout
+    from rich.text import Text
+    from rich.rule import Rule
+    from rich.prompt import Prompt, Confirm
+    from rich.box import ROUNDED, HEAVY, DOUBLE
+    from rich.tree import Tree
+    from rich.columns import Columns
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    print("⚠️ Rich library not installed. Install with: pip install rich")
+    print("Falling back to basic UI...\n")
+
+# Colorama for fallback
+try:
+    from colorama import init as colorama_init, Fore, Style
+    colorama_init(autoreset=True)
+    COLORAMA_AVAILABLE = True
+except ImportError:
+    COLORAMA_AVAILABLE = False
+
+# Console setup
+console = Console() if RICH_AVAILABLE else None
+
+# ========== THEME CONSTANTS ==========
+class Theme:
+    SUCCESS = "bold green"
+    ERROR = "bold red"
+    WARNING = "bold yellow"
+    INFO = "cyan"
+    TITLE = "bold magenta"
+    MUTED = "grey70"
+    HIGHLIGHT = "bold cyan"
+    ACCENT = "bright_blue"
+    DANGER = "bold red on white"
+
+# Fallback string colors for Banner/Menu
+G = Fore.GREEN if COLORAMA_AVAILABLE else ""
+R = Fore.RED if COLORAMA_AVAILABLE else ""
+Y = Fore.YELLOW if COLORAMA_AVAILABLE else ""
+C = Fore.CYAN if COLORAMA_AVAILABLE else ""
+B = Fore.BLUE if COLORAMA_AVAILABLE else ""
+W = Fore.WHITE if COLORAMA_AVAILABLE else ""
+
+# ========== UTILITY FUNCTIONS ==========
+def tprint(msg: str, style: str = Theme.INFO):
+    """Print with theme styling"""
+    if RICH_AVAILABLE and console:
+        console.print(msg, style=style)
+    else:
+        style_map = {
+            Theme.SUCCESS: Fore.GREEN,
+            Theme.ERROR: Fore.RED,
+            Theme.WARNING: Fore.YELLOW,
+            Theme.INFO: Fore.CYAN,
+            Theme.TITLE: Fore.MAGENTA,
+            Theme.HIGHLIGHT: Fore.CYAN,
+            Theme.ACCENT: Fore.BLUE,
+        }
+        color = style_map.get(style, Fore.WHITE)
+        print(f"{color}{msg}{Style.RESET_ALL}")
+
+# ============================================================
+# DIRECTORIES SETUP
+# ============================================================
+
+BASE_DIR = Path("/data/data/com.termux/files/home/LUA")
+
+# Standardized folder structure mapping the internal functions
+ORG_DIR = BASE_DIR / "INPUT"               # Original BGMI files
+STD_DIR = BASE_DIR / "BYTECODE"         # Converted standard bytecode
+DECOMPILED_DIR = BASE_DIR / "DECOMPILED"   # Pure decompiled source
+EDITED_DIR = BASE_DIR / "EDITED"           # Folder where you make your mods
+ENCRYPTED_DIR = BASE_DIR / "REPACK"    # Output compiled BGMI files
+BIN_DIR = BASE_DIR / "bin"                 # Compiler/Decompiler binaries
+
+# URL & Paths for Decompiler
+UNLUAC_URL = "https://github.com/ErosGamerMod/unluac_patched.jar/raw/refs/heads/main/unluac_patched.jar"
+JAR_PATH = BIN_DIR / "unluac_patched.jar"
+
+# CRYPTO CONSTANTS
+# ============================================================
+
+STRING_XOR_KEY = bytes([
+    0x11, 0x21, 0x36, 0x47, 0x46, 0x57, 0xA7, 0x8D,
+    0x9D, 0x84, 0x90, 0xD8, 0xAB, 0x00, 0x8C, 0x35,
+    0x26, 0x1A, 0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3,
+    0x15, 0x07, 0xD0, 0x2C, 0x1E, 0x8F, 0xF6, 0xC8,
+])
+
+# Standard Lua 5.3 opcodes (0-46)
+STANDARD_OPCODES = {
+    0: "MOVE", 1: "LOADK", 2: "LOADKX", 3: "LOADBOOL", 4: "LOADNIL",
+    5: "GETUPVAL", 6: "GETTABUP", 7: "GETTABLE", 8: "SETTABUP", 9: "SETUPVAL",
+    10: "SETTABLE", 11: "NEWTABLE", 12: "SELF", 13: "ADD", 14: "SUB",
+    15: "MUL", 16: "MOD", 17: "POW", 18: "DIV", 19: "IDIV", 20: "BAND",
+    21: "BOR", 22: "BXOR", 23: "SHL", 24: "SHR", 25: "UNM", 26: "BNOT",
+    27: "NOT", 28: "LEN", 29: "CONCAT", 30: "JMP", 31: "EQ", 32: "LT",
+    33: "LE", 34: "TEST", 35: "TESTSET", 36: "CALL", 37: "TAILCALL",
+    38: "RETURN", 39: "FORLOOP", 40: "FORPREP", 41: "TFORCALL", 42: "TFORLOOP",
+    43: "SETLIST", 44: "CLOSURE", 45: "VARARG", 46: "EXTRAARG"
+}
+
+# BGMI Custom opcodes (47-63)
+CUSTOM_OPCODES = {
+    47: "LOADI", 48: "MOVENEAR", 49: "IDIVMOD", 50: "GETFIELD", 51: "SETFIELD",
+    52: "GETATTR", 53: "CALLMETHOD", 54: "PUSHNIL", 55: "BITOP", 56: "CONCATX",
+    57: "FORPREP2", 58: "TFORPREP", 59: "CUSTOM_59", 60: "CUSTOM_60",
+    61: "BITSHIFT", 62: "TRACE", 63: "EXTRAARG2"
+}
+
+ALL_OPCODES = {**STANDARD_OPCODES, **CUSTOM_OPCODES}
+
+
+BGMI_TO_STD = {
+    0:0, 1:1, 17:0, 18:1, 20:3, 21:4, 22:5, 23:6, 24:7, 25:8, 26:9, 27:10, 28:11, 29:12, 
+    31:31, 32:32, 33:33, 34:34, 35:35, 36:36, 38:38, 41:41, 42:42, 43:43, 44:44, 
+    2:1, 30:30, 45:45, 46:46, 47:47, 48:48, 49:49, 50:50, 51:51, 52:52, 53:53, 
+    54:54, 55:55, 56:56, 57:57, 58:58, 59:59, 60:60, 61:61, 62:62, 63:63
+}
+
+
+STD_TO_BGMI = {
+    0: 17, 1: 18, 3: 20, 4: 21, 5: 22, 6: 23, 7: 24, 8: 25, 9: 26, 10: 27, 
+    11: 28, 12: 29, 14: 31, 16: 33, 18: 35, 31: 31, 32: 32, 33: 33, 34: 34, 35: 35, 36: 36, 
+    38: 38, 41: 41, 42: 42, 43: 43, 44: 44, 30: 30, 45: 45, 46: 46, 
+    47: 47, 48: 48, 49: 49, 50: 50, 51: 51, 52: 52, 53: 53, 54: 54, 
+    55: 55, 56: 56, 57: 57, 58: 58, 59: 59, 60: 60, 61: 61, 62: 62, 63: 63
+}
+
+STD_FMT = [0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           2,0,0,0,0,0,0,0,0,2,2,0,2,0,1,0,3,2,0,0,0,0,0,0,0,0,0,2,2,0,0,0,0,3]
+
+
+HEADER_SIZE = 33
+        
+# ============================================================
+# UTILITY FUNCTIONS IMPLEMENTATION
+# ============================================================
+
+class TimeoutError(Exception):
+    pass
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Operation timed out")
+
+def with_timeout(func, seconds=10):
+    """Run function with timeout (Unix only)"""
+    if sys.platform == "win32":
+        return func()
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+    try:
+        result = func()
+        signal.alarm(0)
+        return result
+    except TimeoutError:
+        signal.alarm(0)
+        raise
+    finally:
+        signal.alarm(0)
+
+def setup():
+    """Create all necessary directories and verify dependencies"""
+    for folder in [ORG_DIR, STD_DIR, DECOMPILED_DIR, EDITED_DIR, 
+                    ENCRYPTED_DIR, BIN_DIR]:
+        folder.mkdir(parents=True, exist_ok=True)
+
+def check_java():
+    """Check if Java is installed"""
+    try:
+        result = subprocess.run(["java", "-version"], capture_output=True, text=True, timeout=5)
+        return result.returncode == 0
+    except:
+        return False
+
+def download_unluac():
+    """Download unluac decompiler"""
+    if JAR_PATH.exists():
+        return True
+    tprint("  Downloading unluac_patched.jar...", Theme.INFO)
+    try:
+        urllib.request.urlretrieve(UNLUAC_URL, JAR_PATH)
+        if JAR_PATH.exists() and JAR_PATH.stat().st_size > 10000:
+            tprint(f"  ✓ Download complete: {JAR_PATH.stat().st_size:,} bytes", Theme.SUCCESS)
+            return True
+        else:
+            tprint("  ✗ Download failed - file too small", Theme.ERROR)
+            return False
+    except Exception as e:
+        tprint(f"  ✗ Download error: {e}", Theme.ERROR)
+        return False
+
+def decompile_std(bytecode_data: bytes) -> Tuple[bool, str, str]:
+    """Helper function to execute unluac jar extraction"""
+    if not check_java():
+        return False, "", "Java runtime (JRE) not detected in this Termux environment."
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".luac") as tmp:
+        tmp.write(bytecode_data)
+        tmp_name = tmp.name
+
+    try:
+        cmd = ["java", "-jar", str(JAR_PATH), tmp_name]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0:
+            cleaned_source = clean_pubg_map_garbage(res.stdout)
+            return True, cleaned_source, ""
+        else:
+            return False, "", res.stderr
+    except Exception as e:
+        return False, "", str(e)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+def find_compiler():
+    """Find available Lua compiler"""
+    for comp in ["luac5.3", "luac5.2", "luac5.1", "luac"]:
+        try:
+            result = subprocess.run([comp, "-v"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 or "Lua" in result.stderr:
+                return comp
+        except:
+            continue
+    return None
+
+def get_file_hash(filepath):
+    """Get MD5 hash of a file"""
+    if not filepath.exists():
+        return None
+    with open(filepath, 'rb') as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+def load_opmap(filepath):
+    """Carrega o arquivo de mapeamento de Opcodes da Tencent/BGMI."""
+    mapping = {}
+    try:
+        # Usamos 'utf-8' para garantir leitura correta do arquivo de texto
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # Validação estrita: processa apenas linhas iniciadas com .op
+                if line.startswith('.op'):
+                    parts = line.split() 
+                    if len(parts) >= 3:
+                        # Extrai o ID e o Mnemônico conforme estrutura do seu opmap.txt
+                        opcode_id = int(parts[1])
+                        mnemonic = parts[2]
+                        mapping[opcode_id] = mnemonic
+        
+        if not mapping:
+            print(f"  \033[1;33m[!!]\033[0m Atenção: O arquivo {filepath.name} está vazio ou mal formatado.")
+        else:
+            print(f"  \033[1;32m[OK]\033[0m Opcodes carregados: {len(mapping)} instruções mapeadas.")
+        
+        return mapping
+    except Exception as e:
+        print(f"  \033[1;31m[!!]\033[0m Erro fatal ao carregar {filepath.name}: {e}")
+        return {}
+
+# Definição global da tabela de Opcodes
+OP_TABLE = load_opmap(BIN_DIR / "opmap.txt")
+
+
+# ============================================================
+# BYTECODE CLASSES
+# ============================================================
+
+class _R:
+    """Bytecode Reader"""
+    def __init__(self, d: bytes, sizet: int = 4):
+        self.d = bytearray(d)
+        self.p = 0
+        self.sizet = sizet
+        self.max_p = len(d)
+    
+    def byte(self): 
+        if self.p >= self.max_p:
+            return 0
+        v = self.d[self.p]
+        self.p += 1
+        return v
+    
+    def i32(self):
+        if self.p + 4 > self.max_p:
+            self.p = self.max_p
+            return 0
+        v = struct.unpack_from('<i', self.d, self.p)[0]
+        self.p += 4
+        return v
+    
+    def u32(self):
+        if self.p + 4 > self.max_p:
+            self.p = self.max_p
+            return 0
+        v = struct.unpack_from('<I', self.d, self.p)[0]
+        self.p += 4
+        return v
+    
+    def i64(self):
+        if self.p + 8 > self.max_p:
+            self.p = self.max_p
+            return 0
+        v = struct.unpack_from('<q', self.d, self.p)[0]
+        self.p += 8
+        return v
+    
+    def f64(self):
+        if self.p + 8 > self.max_p:
+            self.p = self.max_p
+            return 0.0
+        v = struct.unpack_from('<d', self.d, self.p)[0]
+        self.p += 8
+        return v
+    
+    def raw(self, n: int):
+        if self.p + n > self.max_p:
+            n = max(0, self.max_p - self.p)
+        v = bytes(self.d[self.p:self.p + n])
+        self.p += n
+        return v
+    
+    def read(self, n: int):
+        return self.raw(n)
+    
+    def bgmi_str(self):
+        """Read BGMI encrypted string"""
+        sz = self.byte()
+        if sz == 0xFF: sz = self.u32()
+        if sz == 0: return None
+        enc = self.raw(sz - 1)
+        decrypted = bytes(enc[i] ^ STRING_XOR_KEY[i % 32] for i in range(len(enc)))
+        return decrypted.decode('utf-8', errors='replace')
+    
+    def std_str(self):
+        """Read standard Lua string"""
+        sz = self.byte()
+        if sz == 0xFF:
+            if self.sizet == 8:
+                sz = struct.unpack_from('<Q', self.d, self.p)[0] if self.p + 8 <= self.max_p else 0
+                self.p += 8
+            else:
+                sz = self.u32()
+        if sz == 0: return None
+        return self.raw(sz - 1).decode('utf-8', errors='replace')
+
+class _W:
+    """Bytecode Writer"""
+    def __init__(self):
+        self.b = bytearray()
+    
+    def byte(self, v): self.b.append(v & 0xFF)
+    def i32(self, v): self.b.extend(struct.pack('<i', v))
+    def u32(self, v): self.b.extend(struct.pack('<I', v))
+    def i64(self, v): self.b.extend(struct.pack('<q', v))
+    def f64(self, v): self.b.extend(struct.pack('<d', v))
+    def raw(self, d): self.b.extend(d)
+    
+    def std_str(self, s):
+        if s is None: self.byte(0); return
+        e = s.encode('utf-8') if isinstance(s, str) else s
+        sz = len(e) + 1
+        if sz < 0xFF: self.byte(sz)
+        else: self.byte(0xFF); self.u32(sz)
+        self.raw(e)
+    
+    def bgmi_str(self, s):
+        if s is None: self.byte(0); return
+        p = s.encode('utf-8') if isinstance(s, str) else s
+        e = bytes(p[i] ^ STRING_XOR_KEY[i % 32] for i in range(len(p)))
+        sz = len(e) + 1
+        if sz < 0xFF: self.byte(sz)
+        else: self.byte(0xFF); self.u32(sz)
+        self.raw(e)
+    
+    def instr(self, op, A, B, C, Bx, sBx, Ax, fmt):
+        if fmt == 0:
+            r = (op & 0x3F) | ((A & 0xFF) << 6) | ((C & 0x1FF) << 14) | ((B & 0x1FF) << 23)
+        elif fmt == 1:
+            r = (op & 0x3F) | ((A & 0xFF) << 6) | ((Bx & 0x3FFFF) << 14)
+        elif fmt == 2:
+            r = (op & 0x3F) | ((A & 0xFF) << 6) | (((sBx + 131071) & 0x3FFFF) << 14)
+        else:
+            r = (op & 0x3F) | ((Ax & 0x3FFFFFF) << 6)
+        self.u32(r)
+    
+    def get(self): return bytes(self.b)
+
+# ============================================================
+# INSTRUCTION EXTRACTION & RESTORATION ENGINE
+# ============================================================
+
+def extract_bgmi_instructions_simple(data: bytes) -> Dict:
+    """Extract BGMI custom instructions safely without hanging"""
+    if data[:4] != b'\x1bLua':
+        raise ValueError("Not a valid Lua bytecode file")
+
+    r = _R(data, sizet=4)
+    r.p = HEADER_SIZE
+    if r.p < r.max_p:
+        r.byte()
+
+    instruction_map = {}
+    func_counter = [0]
+    max_depth = 50
+    max_functions = 1000
+
+    def extract_func(r, func_id="main", depth=0):
+        if depth > max_depth or func_counter[0] >= max_functions or r.p >= r.max_p:
+            return
+        func_counter[0] += 1
+        try:
+            try: r.bgmi_str()
+            except: return
+            r.i32(); r.i32()
+            r.byte(); r.byte(); r.byte()
+
+            code_size_pos = r.p
+            code_size = r.u32()
+            if code_size <= 0 or code_size > 100000:
+                return
+
+            custom_instructions = []
+            for i in range(code_size):
+                if r.p + 4 > r.max_p: break
+                instr_offset = r.p
+                raw_instr = r.u32()
+                opcode = raw_instr & 0x3F
+                std_opcode = BGMI_TO_STD.get(opcode, opcode)
+
+                suspicious = False
+                if std_opcode != opcode or opcode >= 47 or raw_instr == 0xFFFFFFFF or (raw_instr & 0x80000000):
+                    suspicious = True
+
+                if suspicious:
+                    custom_instructions.append({
+                        'index': i, 'offset': instr_offset, 'opcode': opcode,
+                        'std_opcode': std_opcode, 'raw': raw_instr
+                    })
+
+            instruction_map[func_id] = {
+                'offset': code_size_pos, 'code_size': code_size,
+                'custom_count': len(custom_instructions), 'custom_instructions': custom_instructions
+            }
+
+            num_consts = r.u32()
+            if num_consts < 0 or num_consts > 100000: num_consts = 0
+            for _ in range(num_consts):
+                if r.p >= r.max_p: break
+                const_type = r.byte()
+                if const_type == 1: r.byte()
+                elif const_type == 3: r.f64()
+                elif const_type == 19: r.i64()
+                elif const_type in (4, 20): r.bgmi_str()
+
+            num_upvals = r.u32()
+            if num_upvals < 0 or num_upvals > 1000: num_upvals = 0
+            for _ in range(num_upvals):
+                if r.p + 2 > r.max_p: break
+                r.byte(); r.byte()
+
+            num_protos = r.u32()
+            if num_protos < 0 or num_protos > 1000: num_protos = 0
+            for i in range(num_protos):
+                if r.p >= r.max_p: break
+                extract_func(r, f"{func_id}.proto_{i}", depth + 1)
+
+            num_lines = r.u32()
+            if num_lines < 0 or num_lines > 100000: num_lines = 0
+            for _ in range(num_lines):
+                if r.p + 4 > r.max_p: break
+                r.i32()
+
+            num_abs = r.u32()
+            if num_abs < 0 or num_abs > 100000: num_abs = 0
+            for _ in range(num_abs):
+                if r.p + 8 > r.max_p: break
+                r.u32(); r.u32()
+
+            num_locals = r.u32()
+            if num_locals < 0 or num_locals > 10000: num_locals = 0
+            for _ in range(num_locals):
+                if r.p >= r.max_p: break
+                r.bgmi_str(); r.i32(); r.i32()
+
+            num_upval_names = r.u32()
+            if num_upval_names < 0 or num_upval_names > 1000: num_upval_names = 0
+            for _ in range(num_upval_names):
+                if r.p >= r.max_p: break
+                r.bgmi_str()
+        except:
+            return
+
+    extract_func(r)
+    return instruction_map
+    
+def restore_bgmi_instructions_simple(bgmi_data: bytes, original_instructions: Dict):
+    """Restore original BGMI custom instructions during repack using OP_TABLE validation"""
+    if bgmi_data[:4] != b'\x1bLua':
+        raise ValueError("Not a valid Lua bytecode file")
+
+    data = bytearray(bgmi_data)
+    r = _R(data, sizet=4)
+    r.p = HEADER_SIZE
+    if r.p < r.max_p: r.byte()
+
+    restored_count = [0]
+    func_counter = [0]
+    max_depth = 50
+
+    def restore_func(r, data, func_id="main", depth=0):
+        if depth > max_depth or func_counter[0] >= 1000 or r.p >= r.max_p:
+            return
+        func_counter[0] += 1
+        orig_func = original_instructions.get(func_id)
+
+        try:
+            try: r.bgmi_str()
+            except: return
+            r.i32(); r.i32()
+            r.byte(); r.byte(); r.byte()
+
+            code_size = r.u32()
+            if code_size <= 0 or code_size > 100000: return
+            instr_start = r.p
+
+            instructions = []
+            for i in range(code_size):
+                if r.p + 4 > r.max_p: break
+                instructions.append(r.u32())
+
+            if orig_func and orig_func.get('code_size') == code_size:
+                custom_list = orig_func.get('custom_instructions', [])
+                for custom_instr in custom_list:
+                    try:
+                        idx = custom_instr['index']
+                        if idx >= len(instructions): continue
+                        
+                        current_instr = instructions[idx]
+                        current_opcode = current_instr & 0x3F
+                        original_op_id = custom_instr.get('opcode')
+
+                        # --- INTEGRAÇÃO COM OP_TABLE ---
+                        # Verifica se o opcode é reconhecido ou se está na nossa tabela oficial
+                        if original_op_id is not None and original_op_id in OP_TABLE:
+                            pos = instr_start + (idx * 4)
+                            if pos + 4 > len(data): continue
+                            
+                            struct.pack_into('<I', data, pos, custom_instr['raw'])
+                            restored_count[0] += 1
+                        else:
+                            # Log opcional para detectar Opcodes desconhecidos
+                            # print(f"DEBUG: Opcode {original_op_id} ignorado ou não mapeado.")
+                            continue
+                        # --- FIM DA INTEGRAÇÃO ---
+
+                    except Exception:
+                        continue
+
+            # (Resto da estrutura de leitura permanece igual para não quebrar o parser)
+            num_consts = r.u32()
+            if num_consts < 0 or num_consts > 100000: num_consts = 0
+            for _ in range(num_consts):
+                if r.p >= r.max_p: break
+                const_type = r.byte()
+                if const_type == 1: r.byte()
+                elif const_type == 3: r.f64()
+                elif const_type == 19: r.i64()
+                elif const_type in (4, 20): r.std_str()
+
+            num_upvals = r.u32()
+            if num_upvals < 0 or num_upvals > 1000: num_upvals = 0
+            for _ in range(num_upvals):
+                if r.p + 2 > r.max_p: break
+                r.byte(); r.byte()
+
+            num_protos = r.u32()
+            if num_protos < 0 or num_protos > 1000: num_protos = 0
+            for i in range(num_protos):
+                if r.p >= r.max_p: break
+                restore_func(r, data, f"{func_id}.proto_{i}", depth + 1)
+
+            # ... resto do processamento de linhas e locais (mantido igual) ...
+            num_lines = r.u32()
+            if num_lines < 0 or num_lines > 100000: num_lines = 0
+            for _ in range(num_lines):
+                if r.p + 4 > r.max_p: break
+                r.i32()
+
+            num_abs = r.u32()
+            if num_abs < 0 or num_abs > 100000: num_abs = 0
+            for _ in range(num_abs):
+                if r.p + 8 > r.max_p: break
+                r.u32(); r.u32()
+
+            num_locals = r.u32()
+            if num_locals < 0 or num_locals > 10000: num_locals = 0
+            for _ in range(num_locals):
+                if r.p >= r.max_p: break
+                r.std_str(); r.i32(); r.i32()
+
+            num_upval_names = r.u32()
+            if num_upval_names < 0 or num_upval_names > 1000: num_upval_names = 0
+            for _ in range(num_upval_names):
+                if r.p >= r.max_p: break
+                r.std_str()
+
+        except Exception:
+            return
+
+    try: restore_func(r, data)
+    except Exception: pass
+    return bytes(data), restored_count[0]
+
+# ============================================================
+# TRANSLATION ENGINE FUNCTIONS
+# ============================================================
+
+def _cvt_func(r: _R, w: _W, to_std: bool, stats: dict, op_map: dict = None):
+    # Definindo os métodos de leitura/escrita baseados na direção
+    if to_std:
+        read_str = r.bgmi_str
+        write_str = w.std_str
+    else:
+        read_str = r.std_str
+        write_str = w.bgmi_str
+    
+    # Registro de Opcode Original no mapa
+    orig_offset = r.p
+    op = r.byte()
+    if op_map is not None:
+        op_map[orig_offset] = op
+    r.p = orig_offset  # Volta para processar o byte corretamente
+
+    opmap = BGMI_TO_STD if to_std else STD_TO_BGMI
+    
+    write_str(read_str())
+    w.i32(r.i32())
+    ldef_val = struct.unpack('<i', bytes(w.b[-4:]))[0]
+    w.i32(r.i32())
+    w.byte(r.byte()); w.byte(r.byte()); w.byte(r.byte())
+
+    # --- INSTRUÇÕES ---
+    csz = r.u32()
+    if csz > 100000: csz = 0
+    w.u32(csz)
+    inst_meta = []
+    
+    for idx in range(csz):
+        # PROTEÇÃO ANTI-CRASH: Verifica fim de arquivo ou preenchimento
+        if r.p >= r.max_p: break
+        
+        raw_i = r.u32()
+        
+        # Pula bytes de padding se encontrar alinhamento nulo (0x00)
+        if raw_i == 0 and idx > 0:
+            continue
+
+        bop = raw_i & 0x3F
+        A = (raw_i >> 6) & 0xFF
+        C = (raw_i >> 14) & 0x1FF
+        B = (raw_i >> 23) & 0x1FF
+        Bx = (raw_i >> 14) & 0x3FFFF
+        Ax = (raw_i >> 6) & 0x3FFFFFF
+        
+        # Uso do Opmap (Configurado via dicionário BGMI_TO_STD ou STD_TO_BGMI)
+        sop = opmap.get(bop, bop)
+        
+        if bop >= 47 and bop not in BGMI_TO_STD:
+            sop = bop
+            fmt = 0
+            stats['custom_preserved'] = stats.get('custom_preserved', 0) + 1
+        else:
+            fmt = STD_FMT[sop] if sop < len(STD_FMT) else 0
+        
+        inst_offset = len(w.b)
+        inst_meta.append((inst_offset, sop, fmt, A, B, C, Bx, Bx - 131071, Ax, bop))
+        w.instr(sop, A, B, C, Bx, Bx - 131071, Ax, fmt)
+
+    # --- CONSTANTES ---
+    nk = r.u32()
+    if nk > 100000: nk = 0
+    nk_off = len(w.b)
+    w.u32(nk)
+    ank = 0
+    for _ in range(nk):
+        if r.p >= r.max_p: break
+        t = r.byte()
+        w.byte(t)
+        if t == 1: w.byte(r.byte())
+        elif t == 3: w.f64(r.f64())
+        elif t == 19: w.i64(r.i64())
+        elif t in (4, 20): write_str(read_str())
+        ank += 1
+    w.b[nk_off:nk_off + 4] = struct.pack('<I', ank)
+
+    # --- UPVALUES ---
+    nups = r.u32()
+    if nups > 1000: nups = 0
+    w.u32(nups)
+    for _ in range(nups):
+        if r.p + 2 > r.max_p: break
+        w.byte(r.byte()); w.byte(r.byte())
+
+    # --- SUB-FUNÇÕES ---
+    npts = r.u32()
+    if npts > 1000: npts = 0
+    npts_off = len(w.b)
+    w.u32(npts)
+    apts = 0
+    for _ in range(npts):
+        if r.p >= r.max_p: break
+        _cvt_func(r, w, to_std, stats, op_map=op_map)
+        apts += 1
+    w.b[npts_off:npts_off + 4] = struct.pack('<I', apts)
+
+    # --- LINHAS ---
+    nln = r.u32()
+    if nln > 100000: nln = 0
+    nln_off = len(w.b)
+    w.u32(nln)
+    
+    if to_std:
+        lines = []
+        cur = ldef_val
+        for _ in range(nln):
+            if r.p >= r.max_p: break
+            d = r.byte()
+            cur += d if d <= 127 else d - 256
+            lines.append(cur)
+        w.b[nln_off:nln_off + 4] = struct.pack('<I', len(lines))
+        for ln in lines: w.i32(ln)
+        nab = r.u32()
+        if nab > 100000: nab = 0
+        for _ in range(nab):
+            if r.p + 8 > r.max_p: break
+            r.u32(); r.u32()
+    else:
+        lines = [r.i32() for _ in range(nln)]
+        w.b[nln_off:nln_off + 4] = struct.pack('<I', len(lines))
+        prev = ldef_val
+        for ln in lines:
+            d = max(-128, min(127, ln - prev))
+            prev = ln
+            w.byte(d & 0xFF)
+        w.u32(0)
+
+    # --- NOMES ---
+    nloc = r.u32()
+    if nloc > 10000: nloc = 0
+    w.u32(nloc)
+    for _ in range(nloc):
+        if r.p >= r.max_p: break
+        write_str(read_str())
+        w.i32(r.i32()); w.i32(r.i32())
+    
+    nupn = r.u32()
+    if nupn > 1000: nupn = 0
+    w.u32(nupn)
+    for _ in range(nupn):
+        if r.p >= r.max_p: break
+        write_str(read_str())
+
+    # --- CORREÇÕES ---
+    if to_std:
+        for idx, (off, op, fmt, A, B, C, Bx, sbx, Ax, original_bop) in enumerate(inst_meta):
+            needs_fix = False
+            new_A, new_B, new_C, new_Bx = A, B, C, Bx
+            if A > 255: new_A = A & 0xFF; needs_fix = True
+            if fmt in (1, 2):
+                if op == 1 and Bx >= ank: new_Bx = max(0, min(Bx, ank - 1)); needs_fix = True
+                if op == 44 and Bx >= apts: new_Bx = max(0, min(Bx, apts - 1)); needs_fix = True
+                if op in (30, 39, 40, 42):
+                    target = idx + 1 + sbx
+                    if target < 0 or target >= csz:
+                        new_Bx = (((-(idx + 1) if target < 0 else csz - idx - 2) + 131071) & 0x3FFFF); needs_fix = True
+            elif fmt == 0:
+                if (B & 0x100) and (B & 0xFF) >= ank: new_B = max(0, min(B & 0xFF, ank - 1)) | 0x100; needs_fix = True
+                if (C & 0x100) and (C & 0xFF) >= ank: new_C = max(0, min(C & 0xFF, ank - 1)) | 0x100; needs_fix = True
+            
+            if needs_fix:
+                stats['clamped'] = stats.get('clamped', 0) + 1
+                fixed = (op & 0x3F) | ((new_A & 0xFF) << 6) | ((new_C & 0x1FF) << 14) | ((new_B & 0x1FF) << 23) if fmt == 0 else ((op & 0x3F) | ((new_A & 0xFF) << 6) | ((new_Bx & 0x3FFFF) << 14))
+                w.b[off:off + 4] = struct.pack('<I', fixed)
+
+def bgmi_to_std(data: bytes) -> Tuple[bytes, Dict, str]:
+    
+    if data[:4] != b'\x1bLua': raise ValueError(f"Invalid magic: {data[:4]}")
+    r = _R(data, sizet=4)
+    arch = "64-Bit" if len(r.d) > 13 and r.d[13] == 8 else "32-Bit"
+    if len(r.d) > 33 and r.d[33] > 1:
+        for i in range(33, min(len(r.d), 100)):
+            r.d[i] = ((r.d[i] << 4) & 0xF0) | ((r.d[i] >> 4) & 0x0F)
+    w = _W()
+    hdr = bytearray(r.d[:HEADER_SIZE])
+    hdr[13] = 4
+    w.raw(hdr)
+    r.p = HEADER_SIZE
+    w.byte(r.byte())
+    stats = {'clamped': 0, 'custom_preserved': 0}
+    _cvt_func(r, w, to_std=True, stats=stats)
+    return w.get(), stats, arch
+
+def std_to_bgmi(data: bytes) -> bytes:
+    """Convert standard Lua bytecode to BGMI format"""
+    if data[:4] != b'\x1bLua': raise ValueError(f"Invalid magic: {data[:4]}")
+    r = _R(data, sizet=4)
+    w = _W()
+    hdr = bytearray(data[:HEADER_SIZE])
+    hdr[13] = 4
+    w.raw(hdr)
+    r.p = HEADER_SIZE
+    w.byte(r.byte())
+    _cvt_func(r, w, to_std=False, stats={'clamped': 0, 'custom_preserved': 0})
+    return w.get()
+
+def clean_pubg_map_garbage(content: str) -> str:
+    """Remove garbage logs from unluac logs"""
+    lines = content.split('\n')
+    cleaned = []
+    for line in lines:
+        line = line.replace('No pubg_map.properties found. Using standard map.', '')
+        line = line.replace('No pubg_map.properties found.', '')
+        line = line.replace('pubg_map.properties', '')
+        line = re.sub(r'--\s*Decompiled with unluac[^\n]*', '', line)
+        if not line.strip(): continue
+        cleaned.append(line)
+    return '\n'.join(cleaned)
+
+# ============================================================
+# COMPILER PIPELINE CLASS
+# ============================================================
+
+def patch_bgmi_structure(std_bytecode: bytes, original_bgmi: bytes) -> bytes:
+    
+    # Cria um reader para o bytecode padrão compilado
+    r_std = _R(std_bytecode)
+    # Cria um writer para o novo arquivo BGMI
+    w = _W()
+    
+    # 1. Copia o cabeçalho original (mantendo magic e versão customizada do jogo)
+    w.raw(original_bgmi[:HEADER_SIZE])
+    
+    # 2. Pula o byte inicial do reader de bytecode padrão
+    r_std.p = HEADER_SIZE
+    w.byte(r_std.byte())
+    
+    # 3. Executa a conversão via _cvt_func invertendo o processo (std -> bgmi)
+    # Aqui usamos to_std=False para forçar a escrita das strings e opcodes no formato do jogo
+    stats = {'clamped': 0, 'custom_preserved': 0}
+    _cvt_func(r_std, w, to_std=False, stats=stats)
+    
+    return w.get()
+
+def patch_with_template(new_bytecode_path: Path, template_name: str):
+    template_path = STD_DIR / template_name
+    template_data = template_path.read_bytes()
+    new_data = new_bytecode_path.read_bytes()
+
+    # O "Magic" do Lua é \x1bLua. 
+    # O início real do bloco de código principal (Proto) geralmente 
+    # vem logo após a contagem de constantes.
+    # Em vez de 280, procuramos o padrão de bytes que o JOGO sempre espera:
+    
+    # Exemplo: Procurar por um padrão que marca o início do código da função main
+    # Isso varia pouco entre arquivos do mesmo jogo
+    signature = b'\x00\x00\x00\x00\x01\x00\x00\x00' # Exemplo de padrão de início de bloco
+    
+    # Se você encontrar a assinatura, o corte é dinâmico!
+    split_point = template_data.find(signature)
+    
+    if split_point == -1:
+        # Fallback: Se não achar, usa um corte de segurança ou falha com aviso
+        tprint("  ❌ Assinatura não encontrada, abortando...", Theme.ERROR)
+        return None
+
+    # Montagem Dinâmica
+    final_bytes = template_data[:split_point] + new_data[split_point:]
+    
+    return final_bytes
+
+"""    
+def patch_with_template(new_bytecode_path: Path, template_name: str):
+    
+    template_path = STD_DIR / template_name
+    
+    if not template_path.exists():
+        tprint(f"  ❌ Molde não encontrado em {template_path}", Theme.ERROR)
+        return None
+
+    # Lemos o molde (que tem o padrão fixo que você quer)
+    template_data = template_path.read_bytes()
+    # Lemos o seu novo código gerado
+    new_data = new_bytecode_path.read_bytes()
+
+    # O Ponto de Corte: 
+    # O seu cabeçalho fixo no template tem aproximadamente 280 bytes 
+    # (baseado na sequência que você enviou).
+    # Vamos usar um ponto de corte seguro.
+    CUTOFF = 280 
+    
+    # Montagem: Molde(Header + Constantes) + NovoBody(Opcodes funcionais)
+    # Aqui estamos sobrepondo a estrutura "suja" do luac pela estrutura "limpa" do original
+    final_bytes = template_data[:CUTOFF] + new_data[CUTOFF:]
+    
+    return final_bytes
+"""
+# ============================================================
+# Integração no seu Step 3
+# ============================================================
+
+class SimpleBgmiCompiler:
+    def __init__(self, source_code: str, original_bgmi: bytes = None, compiler_path: str = None):
+        self.source = source_code
+        self.original_bgmi = original_bgmi
+        self.compiler = compiler_path or find_compiler()
+
+        self.instruction_patches = None
+        self.meta = None
+
+        if original_bgmi:
+            tprint(" ", Theme.INFO)
+
+            self.instruction_patches = extract_bgmi_instructions_simple(original_bgmi)
+
+            total_custom = sum(
+                func.get('custom_count', 0)
+                for func in self.instruction_patches.values()
+            )
+
+            #tprint(
+                #f"  📊 Found {total_custom} custom instructions in "
+                #f"{len(self.instruction_patches)} functions",
+                #Theme.INFO
+            #)
+
+    def compile(self) -> Tuple[bytes, Dict]:
+
+        if not self.compiler:
+            raise RuntimeError(
+                "Lua compiler not found. Run: pkg install lua53"
+            )
+
+        # ==========================================================
+        # STEP 1 — LUA → STD LUAC
+        # ==========================================================
+
+        tprint("  🛅 Motor ErosGamer Active...", Theme.INFO)
+
+        std_bytecode = self._compile_to_std()
+
+        # ==========================================================
+        # STEP 2 — PATCH ORIGINAL BGMI STRUCTURE
+        # ==========================================================
+
+        if not self.original_bgmi:
+            raise RuntimeError("Original BGMI file missing")
+
+        tprint("", Theme.INFO)
+
+        bgmi_bytecode = patch_bgmi_structure(
+            std_bytecode,
+            self.original_bgmi
+        )
+
+        # ==========================================================
+        # STEP 3 — RESTORE CUSTOM BGMI OPCODES
+        # ==========================================================
+
+        restored_count = 0
+
+        if self.instruction_patches:
+
+            tprint(
+                "",
+                Theme.INFO
+            )
+
+            bgmi_bytecode, restored_count = (
+                restore_bgmi_instructions_simple(
+                    bgmi_bytecode,
+                    self.instruction_patches
+                )
+            )
+
+        # ==========================================================
+        # STEP 4 — FINAL VALIDATION
+        # ==========================================================
+
+        if bgmi_bytecode[:4] != b'\x1bLua':
+            raise RuntimeError("Final BGMI header invalid")
+
+        # ==========================================================
+        # STATS
+        # ==========================================================
+
+        stats = {
+            'std_size': len(std_bytecode),
+            'bgmi_size': len(bgmi_bytecode),
+            'source_size': len(self.source),
+
+            'compression_ratio': (
+                len(bgmi_bytecode) / len(self.source)
+                if self.source else 0
+            ),
+
+            'restored': restored_count > 0,
+            'restored_count': restored_count,
+
+            'functions_detected': (
+                len(self.instruction_patches)
+                if self.instruction_patches else 0
+            )
+        }
+
+        return bgmi_bytecode, stats
+
+    def _compile_to_std(self) -> bytes:
+        tmp_lua = None
+        tmp_luac = None
+        
+        try:
+            import tempfile
+            import subprocess
+            from pathlib import Path
+            
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".lua", encoding='utf-8') as f:
+                f.write(self.source)
+                tmp_lua = f.name
+                
+            tmp_luac = tmp_lua + "c"
+
+            # --- MODIFICAÇÃO AQUI: Apontando para o seu motor customizado ---
+            motor_customizado = str(BIN_DIR / "luac")
+
+            result = subprocess.run(
+                [motor_customizado, "-s", "-o", tmp_luac, tmp_lua],
+                capture_output=True, text=True, timeout=15
+            )
+            # ----------------------------------------------------------------
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Compilation failed: {result.stderr[:200]}")
+
+            bytecode = Path(tmp_luac).read_bytes()
+            if bytecode[:4] != b'\x1bLua':
+                raise RuntimeError("Invalid compiled header")
+
+            return bytes(bytecode)
+            
+        finally:
+            from pathlib import Path
+            for f in [tmp_lua, tmp_luac]:
+                if f and Path(f).exists():
+                    try: 
+                        Path(f).unlink()
+                    except: 
+                        pass
+
+
+    def save_fixed_bytecode(self, bytecode: bytes, output_path: str):
+        
+        try:
+            with open("funciona.lua", "rb") as f:
+                header_fix = f.read(32)
+        except:
+            header_fix = b'\x00' * 32 
+        
+        final_data = header_fix + bytecode
+        
+        with open(output_path, "wb") as f:
+            f.write(final_data)
+        
+        tprint(f"  ✅ Arquivo salvo com alinhamento de segurança em: {output_path}", Theme.SUCCESS)
+
+    def compile(self, output_path: str = None) -> Tuple[bytes, Dict]:
+        if not self.compiler:
+            raise RuntimeError("Lua compiler not found. Run: pkg install lua53")
+
+        # STEP 1
+        tprint("  🛅 Motor ErosGamer Active...", Theme.INFO)
+        std_bytecode = self._compile_to_std()
+
+        # STEP 2
+        if not self.original_bgmi:
+            raise RuntimeError("Original BGMI file missing")
+            
+        tprint("  ", Theme.INFO)
+        bgmi_bytecode = patch_bgmi_structure(std_bytecode, self.original_bgmi)
+
+        # STEP 3
+        restored_count = 0
+        if self.instruction_patches:
+            tprint("  ", Theme.INFO)
+            bgmi_bytecode, restored_count = restore_bgmi_instructions_simple(
+                bgmi_bytecode, 
+                self.instruction_patches
+            )
+
+        # STEP 4
+        if bgmi_bytecode[:4] != b'\x1bLua':
+            raise RuntimeError("Final BGMI header invalid")
+            
+        # STEP 5: Salvar com o Header funcional (Padding)
+        if output_path:
+            self.save_fixed_bytecode(bgmi_bytecode, output_path)
+
+        stats = {
+            'std_size': len(std_bytecode),
+            'bgmi_size': len(bgmi_bytecode),
+            'source_size': len(self.source),
+            'compression_ratio': (len(bgmi_bytecode) / len(self.source) if self.source else 0),
+            'restored': restored_count > 0,
+            'restored_count': restored_count,
+            'functions_detected': (len(self.instruction_patches) if self.instruction_patches else 0)
+        }
+
+        return bgmi_bytecode, stats
+                        
+# ============================================================
+# PIPELINE ACTIONS
+# ============================================================
+
+def verify_files_different():
+    print("\n" + "="*60)
+    print("VERIFICATION: Checking modifications status")
+    print("="*60)
+    org_files = {f.name: f for f in ORG_DIR.glob("*.lua")}
+    enc_files = {f.name: f for f in ENCRYPTED_DIR.glob("*.lua")}
+    if not org_files or not enc_files:
+        tprint("Missing original or processed files to verify.", Theme.WARNING)
+        return False
+    
+    if RICH_AVAILABLE and console:
+        table = Table(title="Verification Results", box=ROUNDED)
+        table.add_column("File", style=Theme.HIGHLIGHT)
+        table.add_column("Original Size", justify="right")
+        table.add_column("Encrypted Size", justify="right")
+        table.add_column("Status", justify="center")
+    
+    for name in org_files:
+        if name in enc_files:
+            oh, eh = get_file_hash(org_files[name]), get_file_hash(enc_files[name])
+            status = "✅ DIFFERENT" if oh != eh else "❌ IDENTICAL"
+            if RICH_AVAILABLE and console:
+                table.add_row(name, f"{org_files[name].stat().st_size:,}", f"{enc_files[name].stat().st_size:,}", status)
+            else:
+                print(f"  {name} -> {status}")
+    if RICH_AVAILABLE and console: console.print(table)
+    
+def step1_bgmi_to_std():
+    # Banner estilo sistema operacional
+    print("\n\033[1;36m" + "╔" + "═"*58 + "╗")
+    print("║" + " "*18 + "PROCESSAMENTO DE BYTECODE" + " "*17 + "║")
+    print("╚" + "═"*58 + "╝\033[0m")
+
+    files = sorted(ORG_DIR.glob("*.lua"))
+
+    if not files:
+        tprint(f"!!! CRITICAL: No files found in {ORG_DIR}", Theme.ERROR)
+        return
+
+    for src in files:
+        # Header do arquivo processado
+        print(f"\n\033[1;33m[TARGET]\033[0m \033[1;37m{src.name}\033[0m")
+        print("-" * 40)
+
+        try:
+            # 1. READ & EXTRACT
+            sys.stdout.write("  \033[1;34m[⟳]\033[0m Iniciando leitura estrutural...")
+            raw = src.read_bytes()
+            patches = extract_bgmi_instructions_simple(raw)
+            sys.stdout.write("\r  \033[1;32m[OK]\033[0m Estrutura extraída com sucesso.   \n")
+
+            # 2. CONVERT
+            sys.stdout.write("  \033[1;34m[⟳]\033[0m Convertendo engine interna...")
+            std_data, stats, arch = bgmi_to_std(raw)
+            sys.stdout.write("\r  \033[1;32m[OK]\033[0m Conversão de opcode completa.   \n")
+            
+            # 3. SAVE
+            std_output = STD_DIR / f"{src.stem}.luac"
+            std_output.write_bytes(std_data)
+
+            # LOG DE SUCESSO (Com estilo)
+            print(f"  \033[1;36m[i]\033[0m Arch: \033[1;33m{arch}\033[0m")
+            print(f"  \033[1;36m[i]\033[0m Funções mapeadas: \033[1;32m{len(patches)}\033[0m")
+            tprint(f"  ✅ Arquivo compilado: {std_output.name}", Theme.SUCCESS)
+            
+            # Pequena pausa dramática
+            time.sleep(0.5)
+
+        except Exception as e:
+            sys.stdout.write("\r  \033[1;31m[!!]\033[0m Erro no fluxo de execução.\n")
+            tprint(f"  Trace: {e}", Theme.ERROR)
+
+def step2_decompile():
+    # Banner estilizado
+    print("\n\033[1;35m" + "╔" + "═"*58 + "╗")
+    print("║" + " "*15 + "MÓDULO DE DESCOMPILAÇÃO (JAVA)" + " "*15 + "║")
+    print("╚" + "═"*58 + "╝\033[0m")
+    
+    download_unluac()
+    
+    files = sorted(STD_DIR.glob("*.luac"))
+    if not files:
+        tprint("!!! AVISO: Nenhum binário .luac encontrado.", Theme.WARNING)
+        return
+
+    for src in files:
+        print(f"\n\033[1;33m[PROCESSANDO]\033[0m \033[1;37m{src.name}\033[0m")
+        
+        try:
+            sys.stdout.write("  \033[1;34m[⟳]\033[0m Executando Unluac (Pode demorar)...")
+            sys.stdout.flush()
+            
+            # Aqui chamamos a função que blindamos com 'latin-1' para evitar erros de bytes
+            ok, code, err = decompile_std(src.read_bytes())
+            
+            if ok:
+                # Salvando como binário puro usando latin-1 para preservar a estrutura
+                out_path_dec = DECOMPILED_DIR / f"{src.stem}.lua"
+                out_path_edit = EDITED_DIR / f"{src.stem}.lua"
+                
+                out_path_dec.write_text(code, encoding='latin-1')
+                out_path_edit.write_text(code, encoding='latin-1')
+                
+                sys.stdout.write("\r  \033[1;32m[OK]\033[0m Descompilação finalizada.        \n")
+                tprint(f"  → Exportado para /DECOMPILED e /EDITED", Theme.SUCCESS)
+            else:
+                sys.stdout.write("\r  \033[1;31m[!!]\033[0m Falha na execução Java.       \n")
+                tprint(f"  ERRO: {err[:60]}...", Theme.ERROR)
+                
+        except Exception as e:
+            sys.stdout.write("\r  \033[1;31m[!!]\033[0m Erro crítico de sistema.       \n")
+            tprint(f"  EXCEÇÃO: {e}", Theme.ERROR)
+            
+def step3_compile():
+    # Banner estilizado
+    print("\n\033[1;32m" + "╔" + "═"*58 + "╗")
+    print("║" + " "*13 + "MÓDULO DE COMPILAÇÃO E RESTAURAÇÃO" + " "*13 + "║")
+    print("╚" + "═"*58 + "╝\033[0m")
+
+    compiler = find_compiler()
+    if not compiler:
+        tprint("!!! CRITICAL: Lua compiler não encontrado!", Theme.ERROR)
+        return
+
+    print(f"  \033[1;36m[i]\033[0m Engine: \033[1;33m{compiler}\033[0m")
+    print(f"  \033[1;36m[i]\033[0m Restauração: \033[1;32mATIVADA\033[0m\n")
+
+    files = [f for f in EDITED_DIR.glob("*.lua") if not f.name.endswith('.backup.lua')]
+    if not files:
+        tprint(f"!!! AVISO: Nenhum arquivo em {EDITED_DIR}", Theme.WARNING)
+        return
+
+    success, failed = 0, []
+
+    for idx, src in enumerate(files, 1):
+        print(f"\033[1;37m[{idx}/{len(files)}]\033[0m Processando \033[1;33m{src.name}\033[0m")
+
+        try:
+            # Check de modificação
+            code = src.read_text(encoding='utf-8', errors='ignore')
+            if not any(m in code for m in ['MODIFIED', 'MOD_VERSION', 'print(']):
+                print("  \033[1;33m[!]\033[0m Nenhuma alteração óbvia detectada.")
+
+            # Compilação
+            sys.stdout.write("  \033[1;34m[⟳]\033[0m Compilando bytecode...")
+            sys.stdout.flush()
+            
+            original_bgmi = (ORG_DIR / f"{src.stem}.lua").read_bytes() if (ORG_DIR / f"{src.stem}.lua").exists() else None
+            bgmi_compiler = SimpleBgmiCompiler(code, original_bgmi, compiler)
+            bgmi_bytecode, stats = bgmi_compiler.compile()
+            
+            out = ENCRYPTED_DIR / f"{src.stem}.lua"
+            out.write_bytes(bgmi_bytecode)
+            sys.stdout.write(f"\r  \033[1;32m[OK]\033[0m Compilado ({stats['bgmi_size']:,} bytes)        \n")
+            success += 1
+
+            
+        except Exception as e:
+            sys.stdout.write("\r  \033[1;31m[!!]\033[0m Erro na compilação.        \n")
+            tprint(f"  ERRO: {e}", Theme.ERROR)
+            failed.append(src.name)
+        print("-" * 50)
+
+    # Resumo Final
+    print("\n\033[1;36m" + "="*50 + "\033[0m")
+    tprint(f"  RESULTADO: {success} processados com sucesso.", Theme.SUCCESS)
+    if failed:
+        tprint(f"  FALHAS: {', '.join(failed)}", Theme.ERROR)
+    print("\033[1;36m" + "="*50 + "\033[0m\n")
+
+
+def banner():
+    os.system("clear")
+    now = datetime.now()
+    
+    # Formata a data e hora em uma única string em amarelo
+    data_hora_formatada = now.strftime('%d-%m-%Y  |  %H:%M:%S')
+    # Centraliza a string com base no tamanho da barra (61 caracteres)
+    linha_centro = f"{Y}{data_hora_formatada}".center(61)
+
+    print(f"""
+{B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{G}  ███████╗██████╗  ██████╗ ███████╗    ██╗     ██╗   ██╗ █████╗ 
+{G}  ██╔════╝██╔══██╗██╔═══██╗██╔════╝    ██║     ██║   ██║██╔══██╗
+{G}  █████╗  ██████╔╝██║   ██║███████╗    ██║     ██║   ██║███████║
+{G}  ██╔══╝  ██╔══██╗██║   ██║╚════██║    ██║     ██║   ██║██╔══██╗
+{G}  ███████╗██║  ██║╚██████╔╝███████║    ███████╗╚██████╔╝██║  ██║
+{G}  ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝    ╚══════╝ ╚═════╝ ╚═╝  ╚═╝
+{C}               BY: @ErosGamerPUBG | LUA 5.3 TOOL
+{linha_centro}
+{B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{W}""")
+
+# ============================================================
+# MAIN INITIALIZATION MENU
+# ============================================================
+
+def main():
+    setup()
+    while True:
+        banner()
+        print(f"{G}[1]{W} Extract Original Metadata 🧩")
+        print(f"{G}[2]{W} Decompile 🌙")
+        print(f"{G}[3]{W} Compile 🌙")
+        print(f"{G}[4]{W} Telegram Channel ♻️")
+        print(f"{R}[0]{W} Exit Console ❎")
+
+        opc = input(f"\n{C}Select Option:{W} ").strip()
+        if opc == "1":
+            step1_bgmi_to_std()
+            input("\nPress ENTER to continue...")
+        elif opc == "2":
+            step2_decompile()
+            input("\nPress ENTER to continue...")
+        elif opc == "3":
+            step3_compile()
+            input("\nPress ENTER to continue...")
+        elif opc == "4":
+                print(C + "\n🔗 Abrindo grupo Telegram..." + Style.RESET_ALL)
+                os.system('am start -a android.intent.action.VIEW -d "https://t.me/erosgame_public"')
+                input("\nPressione ENTER para voltar ao menu...")
+        elif opc == "0":
+            print(f"\n{Y}Saindo... Bons mods!{W}")
+            break
+
+if __name__ == "__main__":
+    main()
